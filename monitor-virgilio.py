@@ -12,7 +12,7 @@ THRESHOLD_ATTEMPTS = 1
 NOTIFY_ON_SUCCESS = True             
 
 
-FONNTE_TOKEN = "mFJ27Do42zXq9UfjMr3z"
+FONNTE_TOKEN = "17JEujJMdzRLRBRqBZmi"
 FONNTE_DEVICE_NO = "6285796181797"
 FONNTE_API = "https://api.fonnte.com/send"
 
@@ -168,4 +168,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-#updated
+#last
