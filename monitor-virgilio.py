@@ -1,0 +1,169 @@
+
+
+import re
+import time
+import requests
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+LOG_PATH = "/var/log/auth.log"       
+WINDOW_MINUTES = 5                    
+THRESHOLD_ATTEMPTS = 1                
+NOTIFY_ON_SUCCESS = True             
+
+
+FONNTE_TOKEN = "17JEujJMdzRLRBRqBZmi"
+FONNTE_DEVICE_NO = "6285796181797"
+FONNTE_API = "https://api.fonnte.com/send"
+
+GEMINI_API_KEY = "AIzaSyAo5O6CY1ekbYiPMYfWTYVBaGU2X4DCZVk"
+GEMINI_ENDPOINT = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.0-flash:generateContent"
+)
+
+FAILED_RE = re.compile(
+    r'Failed password for (?:invalid user )?(\S+) from (\d+\.\d+\.\d+\.\d+)'
+)
+ACCEPTED_RE = re.compile(
+    r'Accepted (?:password|publickey) for (\S+) from (\d+\.\d+\.\d+\.\d+)'
+)
+
+
+def send_whatsapp(message: str):
+    """Kirim pesan WhatsApp via Fonnte API."""
+    if not FONNTE_TOKEN or not FONNTE_DEVICE_NO:
+        print("[WARN] Fonnte token/device belum dikonfigurasikan.")
+        return False
+    try:
+        headers = {"Authorization": FONNTE_TOKEN, "Content-Type": "application/json"}
+        payload = {"target": FONNTE_DEVICE_NO, "message": message}
+        r = requests.post(FONNTE_API, headers=headers, json=payload, timeout=10)
+        print(f"[FONNTE] status={r.status_code}")
+        return r.ok
+    except Exception as e:
+        print("[ERROR] gagal kirim WA:", e)
+        return False
+
+
+def analyze_with_gemini(prompt_text: str, short: bool = False) -> str:
+    """Kirim prompt ke Gemini dan kembalikan teks jawaban."""
+    if not GEMINI_API_KEY:
+        return "(AI nonaktif: GEMINI_API_KEY tidak diset)"
+
+    if short:
+        prompt = prompt_text[:300] + "..." if len(prompt_text) > 300 else prompt_text
+    else:
+        prompt = prompt_text
+
+    url = f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}"
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+            if "candidates" in j and len(j["candidates"]) > 0:
+                try:
+                    return j["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception:
+                    return "(AI error: response parsing failed)"
+            return "(AI error: empty response)"
+        except requests.exceptions.HTTPError as http_e:
+            status = getattr(http_e.response, "status_code", None)
+            if status == 429:
+                wait = attempt * 2
+                print(f"[WARN] Gemini 429 Too Many Requests — retry {attempt}/{max_retries} after {wait}s")
+                time.sleep(wait)
+                continue
+            print(f"[ERROR] AI HTTP error: {http_e}")
+            return f"(AI error: {http_e})"
+        except requests.exceptions.Timeout:
+            wait = attempt * 2
+            print(f"[WARN] Gemini request timed out — retry {attempt}/{max_retries} after {wait}s")
+            time.sleep(wait)
+            continue
+        except Exception as e:
+            print(f"[ERROR] AI unexpected error: {e}")
+            return f"(AI error: {e})"
+
+    return "(AI error: request gagal setelah beberapa retry)"
+
+
+def tail_file(path):
+    """Pantau file log secara realtime (seperti tail -f)"""
+    f = open(path, "r")
+    f.seek(0, 2)
+    inode = None
+    while True:
+        line = f.readline()
+        if line:
+            yield line
+        else:
+            time.sleep(0.5)
+            try:
+                if inode is None:
+                    inode = os.fstat(f.fileno()).st_ino
+                if os.stat(path).st_ino != inode:
+                    f.close()
+                    f = open(path, "r")
+                    inode = os.fstat(f.fileno()).st_ino
+                    f.seek(0, 2)
+            except Exception:
+                pass
+
+
+def main():
+    print("[INFO] Mulai monitoring:", LOG_PATH)
+    tail = tail_file(LOG_PATH)
+    attempts = defaultdict(list)
+
+    for line in tail:
+        now = datetime.utcnow()
+
+        # ---- Login gagal ----
+        m = FAILED_RE.search(line)
+        if m:
+            user, ip = m.group(1), m.group(2)
+            attempts[ip].append(now)
+            cutoff = now - timedelta(minutes=WINDOW_MINUTES)
+            attempts[ip] = [t for t in attempts[ip] if t >= cutoff]
+            count = len(attempts[ip])
+
+            print(f"[{now.isoformat()}] FAILED ip={ip} user={user} count={count}")
+
+            if count >= THRESHOLD_ATTEMPTS:
+                msg = (
+                    f"🚨 Percobaan login SSH mencurigakan\n"
+                    f"IP: {ip}\nUser: {user}\nJumlah percobaan: {count}"
+                )
+                ai_prompt = f"Ringkas: IP {ip}, user {user}, percobaan {count}"
+                ai = analyze_with_gemini(ai_prompt, short=True)
+                send_whatsapp(msg + "\n\n🤖 Analisis AI:\n" + ai)
+                attempts[ip] = []
+            continue
+
+        # ---- Login sukses ----
+        m2 = ACCEPTED_RE.search(line)
+        if m2 and NOTIFY_ON_SUCCESS:
+            user, ip = m2.group(1), m2.group(2)
+            print(f"[{now.isoformat()}] SUCCESS ip={ip} user={user}")
+
+            msg = f"ℹ️ Login sukses\nUser: {user}\nIP: {ip}\nWaktu: {now.isoformat()}"
+            ai_prompt = (
+                f"Anda berhasil login dengan informasi berikut:\n"
+                f"- User: {user}\n"
+                f"- IP: {ip}\n"
+                f"- Waktu: {now.isoformat()}\n\n"
+                "Buat analisis singkat terkait keamanan (apakah ini mencurigakan?) "
+                "dan rekomendasi tindakan jika diperlukan."
+            )
+
+            ai = analyze_with_gemini(ai_prompt, short=False)
+            send_whatsapp(msg + "\n\n🤖 Analisis AI:\n" + ai)
+
+
+if __name__ == "__main__":
+    main()
